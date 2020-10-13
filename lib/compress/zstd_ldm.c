@@ -10,7 +10,7 @@
 
 #include "zstd_ldm.h"
 
-#include "debug.h"
+#include "../common/debug.h"
 #include "zstd_fast.h"          /* ZSTD_fillHashTable() */
 #include "zstd_double_fast.h"   /* ZSTD_fillDoubleHashTable() */
 
@@ -228,11 +228,14 @@ void ZSTD_ldm_fillHashTable(
             ldmState_t* state, const BYTE* ip,
             const BYTE* iend, ldmParams_t const* params)
 {
-    U64 startingHash = ZSTD_rollingHash_compute(ip, params->minMatchLength);
-    ZSTD_ldm_fillLdmHashTable(
-        state, startingHash, ip, iend - params->minMatchLength, state->window.base,
-        params->hashLog - params->bucketSizeLog,
-        *params);
+    DEBUGLOG(5, "ZSTD_ldm_fillHashTable");
+    if ((size_t)(iend - ip) >= params->minMatchLength) {
+        U64 startingHash = ZSTD_rollingHash_compute(ip, params->minMatchLength);
+        ZSTD_ldm_fillLdmHashTable(
+            state, startingHash, ip, iend - params->minMatchLength, state->window.base,
+            params->hashLog - params->bucketSizeLog,
+            *params);
+    }
 }
 
 
@@ -243,10 +246,10 @@ void ZSTD_ldm_fillHashTable(
  *  (after a long match, only update tables a limited amount). */
 static void ZSTD_ldm_limitTableUpdate(ZSTD_matchState_t* ms, const BYTE* anchor)
 {
-    U32 const current = (U32)(anchor - ms->window.base);
-    if (current > ms->nextToUpdate + 1024) {
+    U32 const curr = (U32)(anchor - ms->window.base);
+    if (curr > ms->nextToUpdate + 1024) {
         ms->nextToUpdate =
-            current - MIN(512, current - ms->nextToUpdate - 1024);
+            curr - MIN(512, curr - ms->nextToUpdate - 1024);
     }
 }
 
@@ -283,7 +286,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
 
     while (ip <= ilimit) {
         size_t mLength;
-        U32 const current = (U32)(ip - base);
+        U32 const curr = (U32)(ip - base);
         size_t forwardMatchLength = 0, backwardMatchLength = 0;
         ldmEntry_t* bestEntry = NULL;
         if (ip != istart) {
@@ -362,7 +365,7 @@ static size_t ZSTD_ldm_generateSequences_internal(
         /* No match found -- continue searching */
         if (bestEntry == NULL) {
             ZSTD_ldm_makeEntryAndInsertByTag(ldmState, rollingHash,
-                                             hBits, current,
+                                             hBits, curr,
                                              *params);
             ip++;
             continue;
@@ -374,11 +377,11 @@ static size_t ZSTD_ldm_generateSequences_internal(
 
         {
             /* Store the sequence:
-             * ip = current - backwardMatchLength
+             * ip = curr - backwardMatchLength
              * The match is at (bestEntry->offset - backwardMatchLength)
              */
             U32 const matchIndex = bestEntry->offset;
-            U32 const offset = current - matchIndex;
+            U32 const offset = curr - matchIndex;
             rawSeq* const seq = rawSeqStore->seq + rawSeqStore->size;
 
             /* Out of sequence storage */
@@ -461,6 +464,8 @@ size_t ZSTD_ldm_generateSequences(
             U32 const correction = ZSTD_window_correctOverflow(
                 &ldmState->window, /* cycleLog */ 0, maxDist, chunkStart);
             ZSTD_ldm_reduceTable(ldmState->hashTable, ldmHSize, correction);
+            /* invalidate dictionaries on overflow correction */
+            ldmState->loadedDictEnd = 0;
         }
         /* 2. We enforce the maximum offset allowed.
          *
@@ -469,6 +474,12 @@ size_t ZSTD_ldm_generateSequences(
          * TODO: * Test the chunk size.
          *       * Try invalidation after the sequence generation and test the
          *         the offset against maxDist directly.
+         *
+         * NOTE: Because of dictionaries + sequence splitting we MUST make sure
+         * that any offset used is valid at the END of the sequence, since it may
+         * be split into two sequences. This condition holds when using
+         * ZSTD_window_enforceMaxDist(), but if we move to checking offsets
+         * against maxDist directly, we'll have to carefully handle that case.
          */
         ZSTD_window_enforceMaxDist(&ldmState->window, chunkEnd, maxDist, &ldmState->loadedDictEnd, NULL);
         /* 3. Generate the sequences for the chunk, and get newLeftoverSize. */
@@ -584,7 +595,7 @@ size_t ZSTD_ldm_blockCompress(rawSeqStore_t* rawSeqStore,
         ZSTD_ldm_limitTableUpdate(ms, ip);
         ZSTD_ldm_fillFastTables(ms, ip);
         /* Run the block compressor */
-        DEBUGLOG(5, "calling block compressor on segment of size %u", sequence.litLength);
+        DEBUGLOG(5, "pos %u : calling block compressor on segment of size %u", (unsigned)(ip-istart), sequence.litLength);
         {
             size_t const newLitLength =
                 blockCompressor(ms, seqStore, rep, ip, sequence.litLength);
